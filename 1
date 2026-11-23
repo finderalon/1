@@ -1,0 +1,328 @@
+#@title פאנל החלטות טרום-סגירה — QQQ & SPY { display-mode: "form" }
+QQQ_STAGE = 0 #@param [0, 1, 2, 3] {type:"raw"}
+SPY_STAGE = 0 #@param [0, 1, 2, 3] {type:"raw"}
+SHOW_DEBUG_TABLE = False #@param {type:"boolean"}
+
+# התקנה שקטה רק אם yfinance עדיין לא מותקן בסביבה הנוכחית
+try:
+    import yfinance as yf
+except ImportError:
+    !pip install -q yfinance
+    import yfinance as yf
+
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+import pandas as pd
+from IPython.display import HTML, display
+
+NY_TZ = ZoneInfo("America/New_York")
+IL_TZ = ZoneInfo("Asia/Jerusalem")
+
+PLAN_CONFIG = {
+    "QQQ": {
+        "stage": QQQ_STAGE,
+        "cooldown_until": "2026-11-26",
+        "time_stop_date": "2027-02-15",
+        "rules": {
+            "t1_pullback_high": 642.0,
+            "t1_confirm_close": 635.0,
+            "t1_alt_base": 641.95,
+            "t1_alt_breakout": 658.0,
+            "panic_ref_vol": 134_750_000,
+            "t2_level": 685.0,
+            "t3_weekly_level": 715.0,
+            "stop_stage1_close": 606.0,
+            "stop_stage1_hard": 598.0,
+            "stop_stage2_weekly": 645.0,
+            "profit_target_low": 755.0,
+            "profit_target_high": 765.0,
+        },
+    },
+    "SPY": {
+        "stage": SPY_STAGE,
+        "cooldown_until": "2026-11-26",
+        "time_stop_date": "2027-02-15",
+        "rules": {
+            "t1_pullback_high": 714.0,
+            "t1_confirm_close": 710.0,
+            "t1_alt_base": None,
+            "t1_alt_breakout": None,
+            "panic_ref_vol": 151_400_000,
+            "t2_level": 735.0,
+            "t3_weekly_level": 763.0,
+            "stop_stage1_close": 686.75,
+            "stop_stage1_hard": 679.0,
+            "stop_stage2_weekly": 705.0,
+            "profit_target_low": 778.0,
+            "profit_target_high": 782.0,
+        },
+    },
+}
+
+
+def _to_ny_tz(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(NY_TZ)
+    else:
+        df.index = df.index.tz_convert(NY_TZ)
+    return df
+
+
+def _count_consecutive(series: pd.Series, level: float, direction: str = "above") -> int:
+    count = 0
+    for val in reversed(series.dropna().tolist()):
+        ok = (val > level) if direction == "above" else (val < level)
+        if ok:
+            count += 1
+        else:
+            break
+    return count
+
+
+def fetch_index_data(symbol: str) -> dict:
+    now_ny = datetime.now(NY_TZ)
+    today_ny = now_ny.date()
+    ticker = yf.Ticker(symbol)
+
+    # auto_adjust=False שומר על מחירי המסחר הגולמיים התואמים לקווים ב-TradingView
+    daily = ticker.history(period="400d", interval="1d", auto_adjust=False)
+    if daily.empty or len(daily) < 200:
+        raise ValueError(f"לא התקבלו מספיק נתונים היסטוריים עבור {symbol}")
+
+    daily = _to_ny_tz(daily)
+    completed_daily = daily[daily.index.date < today_ny]
+
+    intraday = ticker.history(period="1d", interval="1m", prepost=False)
+    has_live_today = False
+
+    if not intraday.empty:
+        intraday = _to_ny_tz(intraday)
+        intraday_today = intraday[intraday.index.date == today_ny]
+        if not intraday_today.empty:
+            has_live_today = True
+            live_price = float(intraday_today["Close"].iloc[-1])
+            today_low = float(intraday_today["Low"].min())
+            today_vol = float(intraday_today["Volume"].sum())
+            last_ts = intraday_today.index[-1]
+
+    if has_live_today:
+        closes = pd.concat([completed_daily["Close"], pd.Series([live_price], index=[last_ts])])
+        lows = pd.concat([completed_daily["Low"], pd.Series([today_low], index=[last_ts])])
+        eff_date = today_ny
+        source_note = f"נתון חי ({last_ts.strftime('%H:%M')} NY)"
+    else:
+        closes = daily["Close"]
+        lows = daily["Low"]
+        live_price = float(closes.iloc[-1])
+        today_low = float(lows.iloc[-1])
+        today_vol = float(daily["Volume"].iloc[-1])
+        eff_date = daily.index[-1].date()
+        source_note = f"סגירה אחרונה ({eff_date.isoformat()})"
+
+    return {
+        "closes": closes,
+        "lows": lows,
+        "price": live_price,
+        "today_vol": today_vol,
+        "sma150": float(closes.rolling(150).mean().iloc[-1]),
+        "sma200": float(closes.rolling(200).mean().iloc[-1]),
+        "eff_date": eff_date,
+        "is_weekly": eff_date.weekday() == 4,
+        "source_note": source_note,
+    }
+
+
+def evaluate_plan(symbol: str, cfg: dict) -> dict:
+    d = fetch_index_data(symbol)
+    r = cfg["rules"]
+    stage = cfg["stage"]
+    price = d["price"]
+    sma200 = d["sma200"]
+    sma200_buf = sma200 * 0.98
+    closes = d["closes"]
+    eff_date = d["eff_date"]
+    is_weekly = d["is_weekly"]
+
+    cooldown_until = date.fromisoformat(cfg["cooldown_until"])
+    time_stop_date = date.fromisoformat(cfg["time_stop_date"])
+
+    consec_above_t2 = _count_consecutive(closes, r["t2_level"], "above")
+    consec_below_s1 = _count_consecutive(closes, r["stop_stage1_close"], "below")
+    consec_above_alt = _count_consecutive(closes, r["t1_alt_base"], "above") if r["t1_alt_base"] else 0
+
+    recent_min_low = float(d["lows"].tail(3).min())
+    # בודק שהייתה נסיגה מתחת לתקרת אזור האיסוף מבלי לשבור את רצפת השפל של שישי
+    touched_pullback = r["stop_stage1_close"] < recent_min_low <= r["t1_pullback_high"]
+    vol_ratio_pct = (d["today_vol"] / r["panic_ref_vol"]) * 100
+    vol_calmer = d["today_vol"] < r["panic_ref_vol"]
+
+    signal = "WAIT"
+    headline = "המתנה — אין טריגר פעיל"
+    details = "אף תנאי לא נדלק בשלב הנוכחי. לסגור מסך ולבדוק שוב מחר ב-22:30."
+
+    if stage == 0:
+        if eff_date < cooldown_until:
+            headline = f"תקופת צינון עד {cooldown_until.isoformat()}"
+            details = "לא רודפים אחרי הגאפ. ממתינים לעיכול השוק לפני פתיחת מנה 1."
+        else:
+            pullback_ok = touched_pullback and price > r["t1_confirm_close"] and vol_calmer
+            alt_ok = (
+                r["t1_alt_breakout"] is not None
+                and consec_above_alt >= 3
+                and price > r["t1_alt_breakout"]
+            )
+            if pullback_ok:
+                signal = "BUY"
+                headline = "טריגר מנה 1 (30%) — נר בלימה מאושר"
+                details = (
+                    f"נבדק אזור הנסיגה (נמוך {recent_min_low:.2f}$) וסגירה מעל {r['t1_confirm_close']}$ "
+                    f"במחזור רגוע ({vol_ratio_pct:.0f}% ממחזור הפאניקה). "
+                    f"סטופ חירום קשיח: {r['stop_stage1_hard']}$."
+                )
+            elif alt_ok:
+                signal = "BUY"
+                headline = "טריגר מנה 1 (30%) — פריצת בסיס"
+                details = f"{consec_above_alt} סגירות מעל {r['t1_alt_base']}$ ופריצה מעל {r['t1_alt_breakout']}$."
+            elif touched_pullback:
+                signal = "WATCH"
+                headline = "באזור איסוף — ממתין לאישור סגירה"
+                details = f"המחיר נגע באזור הנסיגה ({recent_min_low:.2f}$), נדרשת סגירה מעל {r['t1_confirm_close']}$."
+
+    elif stage == 1:
+        if price <= r["stop_stage1_hard"]:
+            signal = "STOP"
+            headline = f"סטופ חירום קשיח ({r['stop_stage1_hard']}$) — יציאה מיידית!"
+            details = "שבירה חדה מתחת לרצפת החירום. סגירה מלאה."
+        elif consec_below_s1 >= 2:
+            signal = "STOP"
+            headline = f"סטופ מבני (2 סגירות מתחת ל-{r['stop_stage1_close']}$)"
+            details = "תזת התחתית בוטלה. סגירת מנה 1 ללא דיחוי."
+        elif consec_below_s1 == 1:
+            signal = "WATCH"
+            headline = f"אזהרת סטופ — יום 1 מתוך 2 מתחת ל-{r['stop_stage1_close']}$"
+            details = "סגירה נוספת מחר מתחת לרמה מחייבת יציאה מלאה."
+        elif eff_date >= time_stop_date and price < sma200:
+            signal = "STOP"
+            headline = "סטופ זמן — 60 ימי מסחר מתחת ל-SMA 200"
+            details = "המדד נכשל בהתבססות מעל המגמה הארוכה. לסגור ולחזור למזומן נושא ריבית."
+        elif consec_above_t2 >= 2 or (is_weekly and price > r["t2_level"]):
+            signal = "BUY"
+            headline = f"טריגר מנה 2 (40%) — אישור מעל {r['t2_level']}$!"
+            details = f"התבססות מאושרת ({consec_above_t2} סגירות). לקדם סטופ מבני שבועי ל-{r['stop_stage2_weekly']}$."
+        elif consec_above_t2 == 1:
+            signal = "WATCH"
+            headline = f"התראת מנה 2 — יום 1 מתוך 2 מעל {r['t2_level']}$"
+            details = "סגירה נוספת מחר מעל הרמה תפעיל את מנה 2 (40%)."
+
+    elif stage == 2:
+        if is_weekly and price < r["stop_stage2_weekly"]:
+            signal = "STOP"
+            headline = f"סטופ שבועי שלב 2 (מתחת ל-{r['stop_stage2_weekly']}$)"
+            details = "שבירה בסגירת יום שישי. סגירת כלל הפוזיציה."
+        elif price < r["stop_stage2_weekly"]:
+            signal = "WATCH"
+            headline = f"אזהרה — מתחת לסטופ השבועי ({r['stop_stage2_weekly']}$)"
+            details = "לא יום שישי — לעקוב לקראת הסגירה השבועית."
+        elif is_weekly and price > r["t3_weekly_level"]:
+            signal = "BUY"
+            headline = f"טריגר מנה 3 (30%) — פריצה שבועית מעל {r['t3_weekly_level']}$!"
+            details = f"להשלים ל-100% ולעבור לסטופ נגרר 2% מתחת ל-SMA 200 ({sma200_buf:.2f}$)."
+        elif price > r["t3_weekly_level"]:
+            signal = "WATCH"
+            headline = f"מעל יעד מנה 3 ({r['t3_weekly_level']}$) — ממתין ליום שישי"
+            details = "הטריגר למנה 3 נבדק בסגירה השבועית."
+
+    elif stage == 3:
+        if price < sma200_buf:
+            signal = "STOP"
+            headline = f"סטופ נגרר — שבירת SMA 200 מינוס 2% ({sma200_buf:.2f}$)"
+            details = "סגירה מתחת לרצועת הביטחון. יציאה משמעתית."
+        elif price >= r["profit_target_low"]:
+            signal = "TAKE_PROFIT"
+            headline = f"יעד מימוש שליש ({r['profit_target_low']}$–{r['profit_target_high']}$)"
+            details = "לממש 30%–35% לקיבוע רווח ולהצמיד ליתרה סטופ מתחת ל-SMA 50."
+
+    return {
+        "symbol": symbol,
+        "stage": stage,
+        "price": price,
+        "sma150": d["sma150"],
+        "sma200": sma200,
+        "sma200_buf": sma200_buf,
+        "dist_sma200": ((price / sma200) - 1) * 100,
+        "consec_above_t2": consec_above_t2,
+        "consec_below_s1": consec_below_s1,
+        "vol_ratio_pct": vol_ratio_pct,
+        "is_weekly": is_weekly,
+        "source_note": d["source_note"],
+        "signal": signal,
+        "headline": headline,
+        "details": details,
+        "t2_level": r["t2_level"],
+        "stop_s1": r["stop_stage1_close"],
+        "tv_url": f"https://www.tradingview.com/chart/?symbol={symbol}",
+    }
+
+
+def show_colab_panel(results: list[dict]):
+    now_il = datetime.now(IL_TZ).strftime("%d/%m/%Y %H:%M")
+    now_ny = datetime.now(NY_TZ).strftime("%H:%M")
+    palette = {
+        "BUY": ("#10b981", "#064e3b", "ביצוע קנייה"),
+        "STOP": ("#ef4444", "#7f1d1d", "סטופ / יציאה"),
+        "WATCH": ("#f59e0b", "#78350f", "בהתראה"),
+        "TAKE_PROFIT": ("#3b82f6", "#1e3a8a", "מימוש חלקי"),
+        "WAIT": ("#94a3b8", "#1e293b", "המתנה"),
+    }
+
+    cards = []
+    for res in results:
+        col, bg, tag = palette[res["signal"]]
+        weekly_badge = " • <span style='color:#fbbf24'>סגירה שבועית (שישי)</span>" if res["is_weekly"] else ""
+        cards.append(f"""
+        <div style="background:#1e293b; border-top:4px solid {col}; border-radius:10px; padding:16px; flex:1; min-width:340px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <div>
+              <span style="font-size:22px; font-weight:700; color:#f8fafc;">{res['symbol']}</span>
+              <span style="font-size:12px; background:#334155; color:#e2e8f0; padding:2px 8px; border-radius:6px; margin-right:6px;">שלב {res['stage']}/3</span>
+              <div style="font-size:11px; color:#94a3b8; margin-top:3px;">{res['source_note']}{weekly_badge}</div>
+            </div>
+            <span style="background:{bg}; color:{col}; border:1px solid {col}; padding:4px 10px; border-radius:16px; font-size:12px; font-weight:700;">{tag}</span>
+          </div>
+          <div style="background:#0f172a; border-right:4px solid {col}; padding:10px 12px; border-radius:6px; margin-bottom:12px;">
+            <div style="font-weight:700; font-size:14px; color:#f8fafc; margin-bottom:3px;">{res['headline']}</div>
+            <div style="font-size:12px; color:#cbd5e1; line-height:1.45;">{res['details']}</div>
+          </div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; font-size:12px;">
+            <div style="background:#0f172a; padding:8px; border-radius:6px;"><div style="color:#94a3b8; font-size:11px;">מחיר נוכחי</div><b style="font-size:14px;">${res['price']:.2f}</b></div>
+            <div style="background:#0f172a; padding:8px; border-radius:6px;"><div style="color:#94a3b8; font-size:11px;">SMA 200 (מרחק)</div><b style="font-size:14px;">${res['sma200']:.2f} ({res['dist_sma200']:+.2f}%)</b></div>
+            <div style="background:#0f172a; padding:8px; border-radius:6px;"><div style="color:#94a3b8; font-size:11px;">SMA 150 / באפר 2%</div><b>${res['sma150']:.2f} / ${res['sma200_buf']:.2f}</b></div>
+            <div style="background:#0f172a; padding:8px; border-radius:6px;"><div style="color:#94a3b8; font-size:11px;">מחזור מול יום הפאניקה</div><b>{res['vol_ratio_pct']:.0f}%</b></div>
+            <div style="background:#0f172a; padding:8px; border-radius:6px;"><div style="color:#94a3b8; font-size:11px;">סגירות מעל ${res['t2_level']}</div><b>{res['consec_above_t2']} / 2</b></div>
+            <div style="background:#0f172a; padding:8px; border-radius:6px;"><div style="color:#94a3b8; font-size:11px;">סגירות מתחת ל-${res['stop_s1']}</div><b>{res['consec_below_s1']} / 2</b></div>
+          </div>
+          <div style="margin-top:10px; text-align:left;">
+            <a href="{res['tv_url']}" target="_blank" style="color:#38bdf8; text-decoration:none; font-size:12px; font-weight:700;">פתח גרף ב-TradingView ↗</a>
+          </div>
+        </div>
+        """)
+
+    html = f"""
+    <div dir="rtl" style="font-family:Segoe UI, Arial, sans-serif; background:#0f172a; color:#f1f5f9; padding:18px; border-radius:12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:8px;">
+        <div style="font-size:18px; font-weight:700;">פאנל החלטות טרום-סגירה — QQQ & SPY</div>
+        <div style="font-size:12px; color:#94a3b8;">ישראל: <b style="color:#f8fafc;">{now_il}</b> | ניו יורק: <b style="color:#f8fafc;">{now_ny}</b></div>
+      </div>
+      <div style="display:flex; gap:14px; flex-wrap:wrap;">{''.join(cards)}</div>
+    </div>
+    """
+    display(HTML(html))
+
+
+# הרצה מיידית ושמירת התוצאות במשתנה לשימוש בהמשך המחברת
+index_plan_results = [evaluate_plan(sym, cfg) for sym, cfg in PLAN_CONFIG.items()]
+show_colab_panel(index_plan_results)
+
+if SHOW_DEBUG_TABLE:
+    display(pd.DataFrame(index_plan_results)[["symbol", "stage", "price", "sma150", "sma200", "dist_sma200", "signal"]])
